@@ -8,6 +8,9 @@
 (define-constant err-collection-not-found (err u106))
 (define-constant err-already-verified (err u107))
 (define-constant err-invalid-location (err u108))
+(define-constant err-leaderboard-not-found (err u109))
+(define-constant err-invalid-timeframe (err u110))
+(define-constant err-achievement-exists (err u111))
 
 (define-data-var token-name (string-ascii 12) "Plastix")
 (define-data-var token-symbol (string-ascii 3) "PLX")
@@ -16,6 +19,9 @@
 (define-data-var collection-id-nonce uint u0)
 (define-data-var min-collection-weight uint u100)
 (define-data-var base-reward-rate uint u10)
+(define-data-var leaderboard-season uint u1)
+(define-data-var season-duration uint u10080)
+(define-data-var current-season-start uint u0)
 
 (define-map token-balances principal uint)
 (define-map collection-records 
@@ -45,6 +51,44 @@
   {
     total-collections: uint,
     total-weight: uint
+  }
+)
+(define-map leaderboard-entries 
+  {season: uint, rank: uint}
+  {
+    collector: principal,
+    total-weight: uint,
+    total-collections: uint,
+    reputation-points: uint
+  }
+)
+(define-map reputation-scores 
+  principal 
+  {
+    total-points: uint,
+    current-season-points: uint,
+    achievements: (list 10 (string-ascii 32)),
+    consecutive-seasons: uint,
+    highest-rank: uint
+  }
+)
+(define-map season-participants 
+  {season: uint, collector: principal}
+  {
+    weight-collected: uint,
+    collections-count: uint,
+    final-rank: uint,
+    points-earned: uint
+  }
+)
+(define-map achievement-definitions 
+  (string-ascii 32)
+  {
+    name: (string-ascii 64),
+    description: (string-ascii 128),
+    points-value: uint,
+    requirement-type: (string-ascii 16),
+    requirement-value: uint
   }
 )
 
@@ -174,6 +218,7 @@
             }
           )
           (unwrap-panic (update-location-stats location weight))
+          (unwrap-panic (update-season-participation tx-sender weight))
           (ok collection-id)
         )
         err-not-found
@@ -210,6 +255,7 @@
               )
               (map-set verified-collectors collector true)
               (unwrap-panic (mint-tokens collector reward-amount))
+              (unwrap-panic (update-reputation-for-collection collector weight))
               (ok reward-amount)
             )
             err-already-verified
@@ -246,7 +292,257 @@
   )
 )
 
-;; 
+(define-read-only (get-leaderboard-entry (season uint) (rank uint))
+  (map-get? leaderboard-entries {season: season, rank: rank})
+)
+
+(define-read-only (get-reputation-score (collector principal))
+  (default-to 
+    {total-points: u0, current-season-points: u0, achievements: (list), consecutive-seasons: u0, highest-rank: u999}
+    (map-get? reputation-scores collector)
+  )
+)
+
+(define-read-only (get-season-participant (season uint) (collector principal))
+  (map-get? season-participants {season: season, collector: collector})
+)
+
+(define-read-only (get-achievement-definition (achievement-id (string-ascii 32)))
+  (map-get? achievement-definitions achievement-id)
+)
+
+(define-read-only (get-current-season)
+  (ok (var-get leaderboard-season))
+)
+
+(define-read-only (is-season-active)
+  (let 
+    ((season-start (var-get current-season-start))
+     (duration (var-get season-duration)))
+    (if (is-eq season-start u0)
+      (ok false)
+      (ok (< (- stacks-block-height season-start) duration))
+    )
+  )
+)
+
+(define-read-only (calculate-reputation-points (weight uint) (rank uint))
+  (let 
+    ((base-points (* weight u2))
+     (rank-bonus (if (<= rank u10) (- u110 (* rank u10)) u0)))
+    (ok (+ base-points rank-bonus))
+  )
+)
+
+(define-private (initialize-achievements)
+  (begin
+    (map-set achievement-definitions "FIRST_COLLECTION"
+      {name: "First Steps", description: "Complete your first verified collection", 
+       points-value: u50, requirement-type: "collections", requirement-value: u1})
+    (map-set achievement-definitions "WEIGHT_MILESTONE_1"
+      {name: "Lightweight", description: "Collect 1000kg of plastic waste", 
+       points-value: u100, requirement-type: "weight", requirement-value: u1000})
+    (map-set achievement-definitions "WEIGHT_MILESTONE_2"
+      {name: "Heavyweight", description: "Collect 5000kg of plastic waste", 
+       points-value: u250, requirement-type: "weight", requirement-value: u5000})
+    (map-set achievement-definitions "STREAK_WARRIOR"
+      {name: "Streak Warrior", description: "Participate in 5 consecutive seasons", 
+       points-value: u300, requirement-type: "seasons", requirement-value: u5})
+    (map-set achievement-definitions "TOP_PERFORMER"
+      {name: "Top Performer", description: "Achieve rank 1 in any season", 
+       points-value: u500, requirement-type: "rank", requirement-value: u1})
+    (ok true)
+  )
+)
+
+(define-private (award-achievement (collector principal) (achievement-id (string-ascii 32)))
+  (let 
+    ((current-reputation (get-reputation-score collector))
+     (achievement-def (unwrap! (get-achievement-definition achievement-id) err-not-found))
+     (current-achievements (get achievements current-reputation)))
+    (if (is-none (index-of current-achievements achievement-id))
+      (let 
+        ((new-achievements (unwrap! (as-max-len? (append current-achievements achievement-id) u10) err-invalid-amount)))
+        (map-set reputation-scores collector
+          (merge current-reputation 
+            {
+              total-points: (+ (get total-points current-reputation) (get points-value achievement-def)),
+              achievements: new-achievements
+            }
+          )
+        )
+        (ok (get points-value achievement-def))
+      )
+      err-achievement-exists
+    )
+  )
+)
+
+(define-private (check-and-award-achievements (collector principal))
+  (let 
+    ((profile (unwrap! (get-user-profile collector) err-not-found))
+     (reputation (get-reputation-score collector)))
+    (begin
+      (if (and (>= (get total-collections profile) u1) 
+               (is-none (index-of (get achievements reputation) "FIRST_COLLECTION")))
+        (unwrap-panic (award-achievement collector "FIRST_COLLECTION"))
+        u0)
+      (if (and (>= (get total-weight profile) u1000) 
+               (is-none (index-of (get achievements reputation) "WEIGHT_MILESTONE_1")))
+        (unwrap-panic (award-achievement collector "WEIGHT_MILESTONE_1"))
+        u0)
+      (if (and (>= (get total-weight profile) u5000) 
+               (is-none (index-of (get achievements reputation) "WEIGHT_MILESTONE_2")))
+        (unwrap-panic (award-achievement collector "WEIGHT_MILESTONE_2"))
+        u0)
+      (if (and (>= (get consecutive-seasons reputation) u5) 
+               (is-none (index-of (get achievements reputation) "STREAK_WARRIOR")))
+        (unwrap-panic (award-achievement collector "STREAK_WARRIOR"))
+        u0)
+      (if (and (<= (get highest-rank reputation) u1) 
+               (is-none (index-of (get achievements reputation) "TOP_PERFORMER")))
+        (unwrap-panic (award-achievement collector "TOP_PERFORMER"))
+        u0)
+      (ok true)
+    )
+  )
+)
+
+(define-private (update-season-participation (collector principal) (weight uint))
+  (let 
+    ((current-season (var-get leaderboard-season))
+     (current-participation (default-to 
+                             {weight-collected: u0, collections-count: u0, final-rank: u999, points-earned: u0}
+                             (get-season-participant current-season collector))))
+    (map-set season-participants {season: current-season, collector: collector}
+      {
+        weight-collected: (+ (get weight-collected current-participation) weight),
+        collections-count: (+ (get collections-count current-participation) u1),
+        final-rank: (get final-rank current-participation),
+        points-earned: (get points-earned current-participation)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-reputation-for-collection (collector principal) (weight uint))
+  (let 
+    ((current-reputation (get-reputation-score collector))
+     (base-points (* weight u1)))
+    (map-set reputation-scores collector
+      (merge current-reputation 
+        {
+          current-season-points: (+ (get current-season-points current-reputation) base-points),
+          total-points: (+ (get total-points current-reputation) base-points)
+        }
+      )
+    )
+    (unwrap-panic (check-and-award-achievements collector))
+    (ok base-points)
+  )
+)
+
+(define-public (start-new-season)
+  (if (is-eq tx-sender contract-owner)
+    (begin
+      (var-set leaderboard-season (+ (var-get leaderboard-season) u1))
+      (var-set current-season-start stacks-block-height)
+      (unwrap-panic (initialize-achievements))
+      (ok (var-get leaderboard-season))
+    )
+    err-owner-only
+  )
+)
+
+(define-public (end-season-and-rank)
+  (if (is-eq tx-sender contract-owner)
+    (let 
+      ((current-season (var-get leaderboard-season)))
+      (begin
+        (unwrap-panic (finalize-season-rankings current-season))
+        (ok current-season)
+      )
+    )
+    err-owner-only
+  )
+)
+
+(define-private (finalize-season-rankings (season uint))
+  (begin
+    (ok true)
+  )
+)
+
+(define-public (submit-leaderboard-entry (season uint) (rank uint) (collector principal) (total-weight uint) (total-collections uint))
+  (if (is-eq tx-sender contract-owner)
+    (let 
+      ((reputation-points (unwrap-panic (calculate-reputation-points total-weight rank)))
+       (current-reputation (get-reputation-score collector)))
+      (begin
+        (map-set leaderboard-entries {season: season, rank: rank}
+          {
+            collector: collector,
+            total-weight: total-weight,
+            total-collections: total-collections,
+            reputation-points: reputation-points
+          }
+        )
+        (map-set season-participants {season: season, collector: collector}
+          (merge (default-to 
+                   {weight-collected: u0, collections-count: u0, final-rank: u999, points-earned: u0}
+                   (get-season-participant season collector))
+                 {final-rank: rank, points-earned: reputation-points}
+          )
+        )
+        (map-set reputation-scores collector
+          (merge current-reputation 
+            {
+              total-points: (+ (get total-points current-reputation) reputation-points),
+              highest-rank: (if (< rank (get highest-rank current-reputation)) rank (get highest-rank current-reputation)),
+              consecutive-seasons: (if (is-eq season (+ (get-previous-season-participation collector) u1))
+                                     (+ (get consecutive-seasons current-reputation) u1)
+                                     u1),
+              current-season-points: u0
+            }
+          )
+        )
+        (unwrap-panic (check-and-award-achievements collector))
+        (ok reputation-points)
+      )
+    )
+    err-owner-only
+  )
+)
+
+(define-private (get-previous-season-participation (collector principal))
+  (let 
+    ((current-season (var-get leaderboard-season)))
+    (if (> current-season u1)
+      (if (is-some (get-season-participant (- current-season u1) collector))
+        (- current-season u1)
+        u0)
+      u0
+    )
+  )
+)
+
+(define-public (get-leaderboard-range (season uint) (start-rank uint) (count uint))
+  (ok (map get-leaderboard-entry-by-rank 
+          (generate-range start-rank count)))
+)
+
+(define-private (get-leaderboard-entry-by-rank (rank uint))
+  {rank: rank, entry: (get-leaderboard-entry (var-get leaderboard-season) rank)}
+)
+
+(define-private (generate-range (start uint) (count uint))
+  (if (<= count u10)
+    (list start (+ start u1) (+ start u2) (+ start u3) (+ start u4) 
+          (+ start u5) (+ start u6) (+ start u7) (+ start u8) (+ start u9))
+    (list start)
+  )
+)
 
 (define-private (verify-collection-internal (collection-id uint))
   (match (verify-collection collection-id)
