@@ -11,6 +11,10 @@
 (define-constant err-leaderboard-not-found (err u109))
 (define-constant err-invalid-timeframe (err u110))
 (define-constant err-achievement-exists (err u111))
+(define-constant err-invalid-plastic-type (err u112))
+(define-constant err-plastic-type-not-found (err u113))
+(define-constant err-insufficient-verification-level (err u114))
+(define-constant err-plastic-type-exists (err u115))
 
 (define-data-var token-name (string-ascii 12) "Plastix")
 (define-data-var token-symbol (string-ascii 3) "PLX")
@@ -22,6 +26,7 @@
 (define-data-var leaderboard-season uint u1)
 (define-data-var season-duration uint u10080)
 (define-data-var current-season-start uint u0)
+(define-data-var plastic-type-counter uint u0)
 
 (define-map token-balances principal uint)
 (define-map collection-records 
@@ -32,7 +37,9 @@
     location: (string-ascii 64),
     timestamp: uint,
     verified: bool,
-    reward-amount: uint
+    reward-amount: uint,
+    plastic-type: (string-ascii 16),
+    recycling-score: uint
   }
 )
 (define-map user-profiles 
@@ -42,7 +49,9 @@
     total-weight: uint,
     total-rewards: uint,
     registration-block: uint,
-    verified-collector: bool
+    verified-collector: bool,
+    specialization-type: (string-ascii 16),
+    verification-level: uint
   }
 )
 (define-map verified-collectors principal bool)
@@ -91,6 +100,35 @@
     requirement-value: uint
   }
 )
+(define-map plastic-type-definitions 
+  (string-ascii 16)
+  {
+    name: (string-ascii 64),
+    reward-multiplier: uint,
+    min-verification-level: uint,
+    recycling-difficulty: uint,
+    market-value: uint,
+    environmental-impact: uint
+  }
+)
+(define-map plastic-type-stats 
+  (string-ascii 16)
+  {
+    total-collections: uint,
+    total-weight: uint,
+    total-recycling-score: uint,
+    average-market-value: uint
+  }
+)
+(define-map collector-plastic-specialization 
+  {collector: principal, plastic-type: (string-ascii 16)}
+  {
+    collections-count: uint,
+    total-weight: uint,
+    expertise-level: uint,
+    certification-earned: bool
+  }
+)
 
 (define-read-only (get-name)
   (ok (var-get token-name))
@@ -134,6 +172,45 @@
 
 (define-read-only (calculate-reward (weight uint))
   (ok (* weight (var-get base-reward-rate)))
+)
+
+(define-read-only (get-plastic-type-definition (plastic-type (string-ascii 16)))
+  (map-get? plastic-type-definitions plastic-type)
+)
+
+(define-read-only (get-plastic-type-stats (plastic-type (string-ascii 16)))
+  (default-to 
+    {total-collections: u0, total-weight: u0, total-recycling-score: u0, average-market-value: u0}
+    (map-get? plastic-type-stats plastic-type)
+  )
+)
+
+(define-read-only (get-collector-specialization (collector principal) (plastic-type (string-ascii 16)))
+  (default-to 
+    {collections-count: u0, total-weight: u0, expertise-level: u0, certification-earned: false}
+    (map-get? collector-plastic-specialization {collector: collector, plastic-type: plastic-type})
+  )
+)
+
+(define-read-only (calculate-plastic-reward (weight uint) (plastic-type (string-ascii 16)))
+  (let 
+    ((plastic-def (unwrap! (get-plastic-type-definition plastic-type) err-plastic-type-not-found))
+     (base-reward (* weight (var-get base-reward-rate)))
+     (multiplier (get reward-multiplier plastic-def)))
+    (ok (* base-reward multiplier))
+  )
+)
+
+(define-private (calculate-recycling-score (weight uint) (plastic-type (string-ascii 16)))
+  (match (get-plastic-type-definition plastic-type)
+    plastic-def (let 
+                  ((difficulty (get recycling-difficulty plastic-def))
+                   (market-value (get market-value plastic-def))
+                   (environmental-impact (get environmental-impact plastic-def)))
+                  (+ (* weight u10) (* difficulty u5) (* market-value u3) (* environmental-impact u2))
+                )
+    u0
+  )
 )
 
 (define-private (mint-tokens (recipient principal) (amount uint))
@@ -189,7 +266,9 @@
             total-weight: u0,
             total-rewards: u0,
             registration-block: stacks-block-height,
-            verified-collector: false
+            verified-collector: false,
+            specialization-type: "GENERAL",
+            verification-level: u1
           }
         )
         (ok true)
@@ -199,29 +278,42 @@
   )
 )
 
-(define-public (submit-collection (weight uint) (location (string-ascii 64)))
+(define-public (submit-collection (weight uint) (location (string-ascii 64)) (plastic-type (string-ascii 16)))
   (let 
     ((collection-id (+ (var-get collection-id-nonce) u1))
-     (current-profile (map-get? user-profiles tx-sender)))
+     (current-profile (map-get? user-profiles tx-sender))
+     (plastic-def (map-get? plastic-type-definitions plastic-type)))
     (if (and (> weight u0) (>= weight (var-get min-collection-weight)))
-      (if (is-some current-profile)
-        (begin
-          (var-set collection-id-nonce collection-id)
-          (map-set collection-records collection-id
-            {
-              collector: tx-sender,
-              weight: weight,
-              location: location,
-              timestamp: stacks-block-height,
-              verified: false,
-              reward-amount: u0
-            }
+      (if (and (is-some current-profile) (is-some plastic-def))
+        (let 
+          ((profile (unwrap-panic current-profile))
+           (plastic-info (unwrap-panic plastic-def))
+           (recycling-score (calculate-recycling-score weight plastic-type)))
+          (if (>= (get verification-level profile) (get min-verification-level plastic-info))
+            (begin
+              (var-set collection-id-nonce collection-id)
+              (map-set collection-records collection-id
+                {
+                  collector: tx-sender,
+                  weight: weight,
+                  location: location,
+                  timestamp: stacks-block-height,
+                  verified: false,
+                  reward-amount: u0,
+                  plastic-type: plastic-type,
+                  recycling-score: recycling-score
+                }
+              )
+              (unwrap-panic (update-location-stats location weight))
+              (unwrap-panic (update-season-participation tx-sender weight))
+              (unwrap-panic (update-plastic-type-stats plastic-type weight recycling-score))
+              (unwrap-panic (update-collector-specialization tx-sender plastic-type weight))
+              (ok collection-id)
+            )
+            err-insufficient-verification-level
           )
-          (unwrap-panic (update-location-stats location weight))
-          (unwrap-panic (update-season-participation tx-sender weight))
-          (ok collection-id)
         )
-        err-not-found
+        (if (is-none current-profile) err-not-found err-plastic-type-not-found)
       )
       err-invalid-amount
     )
@@ -250,7 +342,9 @@
                   total-weight: (+ (get total-weight current-profile) weight),
                   total-rewards: (+ (get total-rewards current-profile) reward-amount),
                   registration-block: (get registration-block current-profile),
-                  verified-collector: true
+                  verified-collector: true,
+                  specialization-type: (get specialization-type current-profile),
+                  verification-level: (get verification-level current-profile)
                 }
               )
               (map-set verified-collectors collector true)
@@ -544,6 +638,131 @@
   )
 )
 
+(define-private (update-plastic-type-stats (plastic-type (string-ascii 16)) (weight uint) (recycling-score uint))
+  (let 
+    ((current-stats (get-plastic-type-stats plastic-type)))
+    (map-set plastic-type-stats plastic-type
+      {
+        total-collections: (+ (get total-collections current-stats) u1),
+        total-weight: (+ (get total-weight current-stats) weight),
+        total-recycling-score: (+ (get total-recycling-score current-stats) recycling-score),
+        average-market-value: (if (> (get total-collections current-stats) u0)
+                                (/ (get total-recycling-score current-stats) (get total-collections current-stats))
+                                u0)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-collector-specialization (collector principal) (plastic-type (string-ascii 16)) (weight uint))
+  (let 
+    ((current-spec (get-collector-specialization collector plastic-type))
+     (new-collections (+ (get collections-count current-spec) u1))
+     (new-weight (+ (get total-weight current-spec) weight))
+     (new-expertise (+ (get expertise-level current-spec) u1)))
+    (map-set collector-plastic-specialization {collector: collector, plastic-type: plastic-type}
+      {
+        collections-count: new-collections,
+        total-weight: new-weight,
+        expertise-level: new-expertise,
+        certification-earned: (or (get certification-earned current-spec) (>= new-collections u10))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-plastic-type (plastic-type (string-ascii 16)) (name (string-ascii 64)) (reward-multiplier uint) (min-verification-level uint) (recycling-difficulty uint) (market-value uint) (environmental-impact uint))
+  (if (is-eq tx-sender contract-owner)
+    (if (is-none (get-plastic-type-definition plastic-type))
+      (begin
+        (map-set plastic-type-definitions plastic-type
+          {
+            name: name,
+            reward-multiplier: reward-multiplier,
+            min-verification-level: min-verification-level,
+            recycling-difficulty: recycling-difficulty,
+            market-value: market-value,
+            environmental-impact: environmental-impact
+          }
+        )
+        (map-set plastic-type-stats plastic-type
+          {
+            total-collections: u0,
+            total-weight: u0,
+            total-recycling-score: u0,
+            average-market-value: u0
+          }
+        )
+        (ok plastic-type)
+      )
+      err-plastic-type-exists
+    )
+    err-owner-only
+  )
+)
+
+(define-public (update-plastic-type-multiplier (plastic-type (string-ascii 16)) (new-multiplier uint))
+  (if (is-eq tx-sender contract-owner)
+    (let 
+      ((plastic-def (unwrap! (get-plastic-type-definition plastic-type) err-plastic-type-not-found)))
+      (map-set plastic-type-definitions plastic-type
+        (merge plastic-def {reward-multiplier: new-multiplier})
+      )
+      (ok new-multiplier)
+    )
+    err-owner-only
+  )
+)
+
+(define-public (set-collector-verification-level (collector principal) (new-level uint))
+  (if (is-eq tx-sender contract-owner)
+    (let 
+      ((profile (unwrap! (get-user-profile collector) err-not-found)))
+      (map-set user-profiles collector
+        (merge profile {verification-level: new-level})
+      )
+      (ok new-level)
+    )
+    err-owner-only
+  )
+)
+
+(define-public (set-collector-specialization (collector principal) (plastic-type (string-ascii 16)))
+  (if (is-eq tx-sender contract-owner)
+    (let 
+      ((profile (unwrap! (get-user-profile collector) err-not-found)))
+      (if (is-some (get-plastic-type-definition plastic-type))
+        (begin
+          (map-set user-profiles collector
+            (merge profile {specialization-type: plastic-type})
+          )
+          (ok plastic-type)
+        )
+        err-plastic-type-not-found
+      )
+    )
+    err-owner-only
+  )
+)
+
+(define-public (initialize-default-plastic-types)
+  (if (is-eq tx-sender contract-owner)
+    (begin
+      (unwrap-panic (create-plastic-type "PET" "Polyethylene Terephthalate" u150 u1 u3 u8 u7))
+      (unwrap-panic (create-plastic-type "HDPE" "High-Density Polyethylene" u130 u1 u2 u7 u6))
+      (unwrap-panic (create-plastic-type "PVC" "Polyvinyl Chloride" u200 u2 u8 u5 u9))
+      (unwrap-panic (create-plastic-type "LDPE" "Low-Density Polyethylene" u110 u1 u4 u4 u5))
+      (unwrap-panic (create-plastic-type "PP" "Polypropylene" u120 u1 u3 u6 u5))
+      (unwrap-panic (create-plastic-type "PS" "Polystyrene" u180 u2 u7 u3 u8))
+      (unwrap-panic (create-plastic-type "OTHER" "Other Plastics" u90 u3 u9 u2 u6))
+      (ok true)
+    )
+    err-owner-only
+  )
+)
+
 (define-private (verify-collection-internal (collection-id uint))
   (match (verify-collection collection-id)
     success success
@@ -576,3 +795,8 @@
     base-reward-rate: (var-get base-reward-rate)
   })
 )
+
+
+
+
+
